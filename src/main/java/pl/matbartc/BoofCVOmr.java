@@ -1,12 +1,15 @@
 package pl.matbartc;
 
+import boofcv.abst.fiducial.QrCodeDetector;
 import boofcv.alg.distort.RemovePerspectiveDistortion;
+import boofcv.alg.fiducial.qrcode.QrCode;
 import boofcv.alg.filter.binary.BinaryImageOps;
 import boofcv.alg.filter.binary.Contour;
 import boofcv.alg.filter.binary.GThresholdImageOps;
 import boofcv.alg.filter.blur.GBlurImageOps;
 import boofcv.alg.shapes.ShapeFittingOps;
 import boofcv.core.image.ConvertImage;
+import boofcv.factory.fiducial.FactoryFiducial;
 import boofcv.gui.ListDisplayPanel;
 import boofcv.gui.binary.VisualizeBinaryData;
 import boofcv.gui.feature.VisualizeShapes;
@@ -22,36 +25,56 @@ import boofcv.struct.image.GrayU8;
 import boofcv.struct.image.ImageType;
 import boofcv.struct.image.Planar;
 import georegression.struct.point.Point2D_F64;
+import org.ddogleg.struct.FastQueue;
 
 import javax.swing.*;
 import java.awt.*;
 import java.awt.image.BufferedImage;
+import java.awt.image.ColorModel;
+import java.awt.image.WritableRaster;
+import java.util.HashMap;
 import java.util.List;
 
 public class BoofCVOmr {
 
     // Used to bias it towards more or fewer sides. larger number = fewer sides
-    static double cornerPenalty = 0.5;
+    static double cornerPenalty = 0.1;
     // The fewest number of pixels a side can have
-    static int minSide = 10;
+    static int minSide = 7;
 
+    static BufferedImage deepCopy(BufferedImage bi) {
+        ColorModel cm = bi.getColorModel();
+        boolean isAlphaPremultiplied = cm.isAlphaPremultiplied();
+        WritableRaster raster = bi.copyData(null);
+        return new BufferedImage(cm, raster, isAlphaPremultiplied, null);
+    }
 
     public static void processPhoto(String imagePath) {
         ListDisplayPanel panel = new ListDisplayPanel();
         BufferedImage buffered = UtilImageIO.loadImage(UtilIO.pathExample(imagePath));
+        BufferedImage bufferedCopy = deepCopy(buffered);
 
         panel.addImage(buffered,"Original");
-
-        RemovePerspectiveDistortion<Planar<GrayF32>> removePerspective =
-                new RemovePerspectiveDistortion<>(buffered.getWidth(), buffered.getHeight(), ImageType.pl(3, GrayF32.class));
+        HashMap<String, Point2D_F64> fiducials = detectFiducials(panel, bufferedCopy);
 
         Planar<GrayF32> input = ConvertBufferedImage.convertFrom(buffered, true, ImageType.pl(3, GrayF32.class));
+        RemovePerspectiveDistortion<Planar<GrayF32>> removePerspective =
+                new RemovePerspectiveDistortion<>(
+                        dist(fiducials.get("TL"), fiducials.get("TR")),
+                        dist(fiducials.get("TR"), fiducials.get("BR")),
+                        ImageType.pl(3, GrayF32.class));
 
         // Specify the corners in the input image of the region.
         // Order matters! top-left, top-right, bottom-right, bottom-left
+//        if( !removePerspective.apply(input,
+////                new Point2D_F64(88, 61), new Point2D_F64(1011, 68),
+////                new Point2D_F64(1106, 895), new Point2D_F64(27, 913)) ){
+////            throw new RuntimeException("Failed!?!?");
+////        }
+
         if( !removePerspective.apply(input,
-                new Point2D_F64(88, 61), new Point2D_F64(1011, 68),
-                new Point2D_F64(1106, 895), new Point2D_F64(27, 913)) ){
+                fiducials.get("TL"), fiducials.get("TR"),
+                fiducials.get("BR"), fiducials.get("BL")) ){
             throw new RuntimeException("Failed!?!?");
         }
 
@@ -71,7 +94,7 @@ public class BoofCVOmr {
         ConvertImage.average(blurred,unweighted);
 
         GrayU8 binary = new GrayU8(blurred.width,blurred.height);
-        GThresholdImageOps.localSauvola(unweighted, binary,  ConfigLength.fixed(75), 0.2f, true);
+        GThresholdImageOps.localSauvola(unweighted, binary,  ConfigLength.fixed(50), 0.2f, true);
         panel.addImage(VisualizeBinaryData.renderBinary(binary, false, null),"Local: Sauvola");
 
         // Find the contour around the shapes
@@ -101,5 +124,63 @@ public class BoofCVOmr {
 
         JFrame window = ShowImages.showWindow(panel,"OMR PoC",true);
         window.setVisible(true);
+    }
+
+    private static HashMap<String, Point2D_F64> detectFiducials(ListDisplayPanel panel, BufferedImage buffered) {
+        HashMap<String, Point2D_F64> fiducials = new HashMap<>();
+
+        GrayU8 gray = ConvertBufferedImage.convertFrom(buffered,(GrayU8)null);
+
+        QrCodeDetector<GrayU8> detector = FactoryFiducial.qrcode(null,GrayU8.class);
+        detector.process(gray);
+
+        // Get's a list of all the qr codes it could successfully detect and decode
+        List<QrCode> detections = detector.getDetections();
+
+        Graphics2D g2 = buffered.createGraphics();
+        int strokeWidth = Math.max(4,buffered.getWidth()/200); // in large images the line can be too thin
+        g2.setColor(Color.GREEN);
+        g2.setStroke(new BasicStroke(strokeWidth));
+        for( QrCode qr : detections ) {
+            // The message encoded in the marker
+            System.out.println("message: " + qr.message + " bounds: " + qr.bounds.toString());
+
+            fiducials.put(qr.message, calculateCenterOfMass2D(qr.bounds.vertexes));
+
+            // Visualize its location in the image
+            VisualizeShapes.drawPolygon(qr.bounds,true,1,g2);
+        }
+
+        // List of objects it thinks might be a QR Code but failed for various reasons
+        List<QrCode> failures = detector.getFailures();
+        g2.setColor(Color.RED);
+        for( QrCode qr : failures ) {
+            // If the 'cause' is ERROR_CORRECTION or later then it's probably a real QR Code that
+            if( qr.failureCause.ordinal() < QrCode.Failure.ERROR_CORRECTION.ordinal() )
+                continue;
+
+            VisualizeShapes.drawPolygon(qr.bounds,true,1,g2);
+        }
+
+        panel.addImage(buffered,"Example QR Codes");
+        return fiducials;
+    }
+
+    private static Point2D_F64 calculateCenterOfMass2D(FastQueue<Point2D_F64> vertexes) {
+        Point2D_F64 centerOfMass = new Point2D_F64();
+        for(int i = 0; i < vertexes.size; i++) {
+            Point2D_F64 p = vertexes.get(i);
+            centerOfMass.x += p.x;
+            centerOfMass.y += p.y;
+        }
+
+        centerOfMass.x /= vertexes.size;
+        centerOfMass.y /= vertexes.size;
+
+        return centerOfMass;
+    }
+
+    private static int dist(Point2D_F64 p1, Point2D_F64 p2) {
+        return (int) Math.round(Math.sqrt(Math.pow(p1.x - p2.x, 2d) + Math.pow(p1.y - p2.y, 2d)));
     }
 }
